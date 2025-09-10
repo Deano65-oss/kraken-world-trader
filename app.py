@@ -2,7 +2,8 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 import os, logging, time, sqlite3, psycopg2, shutil
 from trading import start_trading, PAIRS
-from utils import send_alert, log_error, review_with_gpt4o, review_with_gpt5
+from utils import send_alert, log_error, review_with_gpt4o, review_with_gpt5, predict_compounding
+from krakenex import API
 
 app = Flask(__name__)
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', ''))
@@ -18,6 +19,17 @@ def auto_configure_env():
         logging.warning(f"Missing vars: {missing}. Guidance: {response.choices[0].message.content}")
         return False
     return True
+
+def check_api_connections():
+    try:
+        kraken = API()
+        kraken.load_key((os.getenv('KRAKEN_API_KEY'), os.getenv('KRAKEN_API_SECRET')))
+        kraken.query_public('Time')
+        client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "Test"}], max_tokens=10)
+        return True
+    except Exception as e:
+        log_error(f"API check failed: {e}")
+        return False
 
 def check_system_health():
     try:
@@ -35,16 +47,29 @@ def check_system_health():
 def jarvis():
     if request.method == 'POST':
         query = request.json.get('query', '')
-        prompt = f"Act as Jarvis, the AI assistant. User query: {query}. Provide guidance or action for the Kraken trading system. Current status: {check_system_health()}. Suggest next steps."
+        prompt = f"Act as Jarvis, the AI assistant. User query: {query}. Provide guidance or action for the Kraken trading system. Current status: {check_system_health()}. Suggest next steps for 2% daily compounding target."
         response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=500)
         return jsonify({"response": response.choices[0].message.content})
-    return jsonify({"status": check_system_health(), "message": "Ask Jarvis anything (POST with 'query')"})
+    return jsonify({"status": check_system_health(), "message": "Ask Jarvis anything (POST with 'query')", "target": "2% daily growth"})
 
 @app.route('/')
 def health_check():
     write_heartbeat()
     backup_database()
     return "Kraken Trader Running", 200
+
+@app.route('/dashboard')
+def dashboard():
+    conn_sqlite = sqlite3.connect('trader.db', check_same_thread=False)
+    cursor = conn_sqlite.execute("SELECT pair, SUM(pnl) as pnl FROM daily_pnl GROUP BY pair")
+    performance = {row[0]: row[1] for row in cursor.fetchall()}
+    return f"""
+    <h1>Trading Dashboard</h1>
+    <p>Performance: {performance}</p>
+    <p>Status: {'Running' if os.path.exists('heartbeat.txt') else 'Down'}</p>
+    <p>Last Update: {open('heartbeat.txt').readlines()[-1] if os.path.exists('heartbeat.txt') else 'N/A'}</p>
+    <p>Target: 2% Daily Growth</p>
+    """, 200
 
 def write_heartbeat():
     with open('heartbeat.txt', 'a') as f:
@@ -65,3 +90,4 @@ if __name__ == "__main__":
         exit(1)
     check_api_connections()
     start_trading(PAIRS, review_with_gpt4o, review_with_gpt5)
+    predict_compounding(10000, 0.02, 365)  # Initial prediction with 2% target
