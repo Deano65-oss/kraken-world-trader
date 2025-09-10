@@ -1,7 +1,7 @@
 import os, time, sqlite3, psycopg2, logging, numpy as np
 from krakenex import API
 from data import get_market_data
-from utils import send_alert, log_error, review_with_gpt4o, review_with_gpt5
+from utils import send_alert, log_error, review_with_gpt4o, review_with_gpt5, optimize_performance, predict_compounding
 from openai import OpenAI
 
 PAIRS = ['XBTUSD', 'ETHUSD', 'ADAUSD']
@@ -17,16 +17,17 @@ def init_database(conn_sqlite, conn_postgres):
 
 def adjust_strategy(pairs, historical_data):
     volatility = {pair: np.std([data['price'] for data in historical_data.get(pair, [])[-100:]]) for pair in pairs}
-    high_vol = [pair for pair, vol in volatility.items() if vol > np.mean(list(volatility.values()))]
-    return high_vol if high_vol else pairs, min(0.1, 0.01 * len(high_vol or pairs))
+    high_vol = [pair for pair, vol in volatility.items() if vol > np.mean(list(volatility.values())) * 1.5]  # 50% above average
+    return high_vol if high_vol else pairs, min(0.1, 0.02 * len(high_vol or pairs))  # Adjust for 2% target
 
-def optimize_performance(conn_sqlite):
-    cursor = conn_sqlite.execute("SELECT pair, SUM(pnl) as total_pnl FROM daily_pnl GROUP BY pair")
-    performance = {row[0]: row[1] for row in cursor.fetchall()}
-    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    prompt = f"Optimize trading: {performance}. Suggest top 3 pairs for max compounding growth."
-    response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=200)
-    return response.choices[0].message.content.split()[:3]
+def phase_implementation(phase):
+    if phase == 1:
+        return "Phase 1: API Connections Tested"
+    elif phase == 2:
+        return "Phase 2: Dry Run Trading Simulated (2% target)"
+    elif phase == 3:
+        return "Phase 3: Live Trading Started (2% target)"
+    return "Phase Complete"
 
 def execute_trade(pair, data, amount, gpt4o_review, gpt5_review, conn_sqlite, conn_postgres):
     price = data['price']
@@ -46,15 +47,6 @@ def execute_trade(pair, data, amount, gpt4o_review, gpt5_review, conn_sqlite, co
             conn_sqlite.commit()
             conn_postgres.commit()
             logging.info(f"Executed {action} {amount} {pair} at {price}")
-
-def phase_implementation(phase):
-    if phase == 1:
-        return "Phase 1: API Connections Tested"
-    elif phase == 2:
-        return "Phase 2: Dry Run Trading Simulated"
-    elif phase == 3:
-        return "Phase 3: Live Trading Started"
-    return "Phase Complete"
 
 def start_trading(pairs, gpt4o_review, gpt5_review):
     conn_sqlite = sqlite3.connect('trader.db', check_same_thread=False)
@@ -86,9 +78,10 @@ def start_trading(pairs, gpt4o_review, gpt5_review):
                     if len(historical_data[pair]) > 100:
                         historical_data[pair].pop(0)
                     execute_trade(pair, data, amount_per_trade, gpt4o_review, gpt5_review, conn_sqlite, conn_postgres)
-                if time.time() % 86400 < 60:
+                if time.time() % 86400 < 60:  # Daily
                     global PAIRS
                     PAIRS = optimize_performance(conn_sqlite) or PAIRS
+                    predict_compounding(10000, 0.02, 365)  # Recalculate with 2% target
                 send_alert(phase_implementation(phase))
             time.sleep(CHECK_INTERVAL)
         except Exception as e:
