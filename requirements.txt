@@ -1,0 +1,7 @@
+flask
+requests
+websocket-client
+numpy
+krakenex
+psycopg2-binary
+openai
