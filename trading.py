@@ -1,229 +1,97 @@
-import time
-import logging
-import sqlite3
-import psycopg2
-from agents import AgentSystem
-from data import get_market_data, pre_load_ohlc, start_websocket, get_external_data
-from utils import log_error, send_alert
-import os
+import os, time, sqlite3, psycopg2, logging, numpy as np
+from krakenex import API
+from data import get_market_data
+from utils import send_alert, log_error, review_with_gpt4o, review_with_gpt5
+from openai import OpenAI
+
+PAIRS = ['XBTUSD', 'ETHUSD', 'ADAUSD']
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', 60))
+
+def init_database(conn_sqlite, conn_postgres):
+    conn_sqlite.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, pair TEXT, action TEXT, amount REAL, price REAL)''')
+    conn_sqlite.execute('''CREATE TABLE IF NOT EXISTS daily_pnl (date TEXT, pair TEXT, pnl REAL, trades INTEGER, PRIMARY KEY (date, pair))''')
+    conn_postgres.execute('''CREATE TABLE IF NOT EXISTS trades (id SERIAL PRIMARY KEY, timestamp TEXT, pair TEXT, action TEXT, amount REAL, price REAL)''')
+    conn_postgres.execute('''CREATE TABLE IF NOT EXISTS daily_pnl (date TEXT, pair TEXT, pnl REAL, trades INTEGER, PRIMARY KEY (date, pair))''')
+    conn_sqlite.commit()
+    conn_postgres.commit()
+
+def adjust_strategy(pairs, historical_data):
+    volatility = {pair: np.std([data['price'] for data in historical_data.get(pair, [])[-100:]]) for pair in pairs}
+    high_vol = [pair for pair, vol in volatility.items() if vol > np.mean(list(volatility.values()))]
+    return high_vol if high_vol else pairs, min(0.1, 0.01 * len(high_vol or pairs))
+
+def optimize_performance(conn_sqlite):
+    cursor = conn_sqlite.execute("SELECT pair, SUM(pnl) as total_pnl FROM daily_pnl GROUP BY pair")
+    performance = {row[0]: row[1] for row in cursor.fetchall()}
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+    prompt = f"Optimize trading: {performance}. Suggest top 3 pairs for max compounding growth."
+    response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": prompt}], max_tokens=200)
+    return response.choices[0].message.content.split()[:3]
+
+def execute_trade(pair, data, amount, gpt4o_review, gpt5_review, conn_sqlite, conn_postgres):
+    price = data['price']
+    action = 'buy' if gpt4o_review(pair, price) and gpt5_review(pair, price) else 'sell'
+    if os.getenv('DRY_RUN', 'true').lower() == 'true':
+        log_error(f"[DRY RUN] Would {action} {amount} {pair} at {price}")
+    else:
+        kraken = API()
+        kraken.load_key((os.getenv('KRAKEN_API_KEY'), os.getenv('KRAKEN_API_SECRET')))
+        response = kraken.query_private(f'AddOrder', {'pair': pair, 'type': action, 'ordertype': 'limit', 'price': price, 'volume': amount})
+        if response['error']:
+            log_error(f"Trade failed: {response['error']}")
+        else:
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)", (timestamp, pair, action, amount, price))
+            conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)", (timestamp, pair, action, amount, price))
+            conn_sqlite.commit()
+            conn_postgres.commit()
+            logging.info(f"Executed {action} {amount} {pair} at {price}")
+
+def phase_implementation(phase):
+    if phase == 1:
+        return "Phase 1: API Connections Tested"
+    elif phase == 2:
+        return "Phase 2: Dry Run Trading Simulated"
+    elif phase == 3:
+        return "Phase 3: Live Trading Started"
+    return "Phase Complete"
 
 def start_trading(pairs, gpt4o_review, gpt5_review):
-    api_key = os.getenv('KRAKEN_API_KEY')
-    api_secret = os.getenv('KRAKEN_API_SECRET')
-    if not api_key or not api_secret:
-        raise Exception("Set KRAKEN_API_KEY and KRAKEN_API_SECRET")
-
-    logging.info(f"Starting Kraken 24/7 Trading Bot at 10:15 AM BST, September 10, 2025...")
-    logging.info(f"Dry Run: {os.getenv('DRY_RUN', 'true')}")
-    agent_system = AgentSystem(pairs)
     conn_sqlite = sqlite3.connect('trader.db', check_same_thread=False)
-    conn_sqlite.execute('''CREATE TABLE IF NOT EXISTS trades
-                           (id INTEGER PRIMARY KEY, timestamp TEXT, pair TEXT, action TEXT, amount REAL, price REAL)''')
-    conn_sqlite.execute('''CREATE TABLE IF NOT EXISTS daily_pnl
-                           (date TEXT PRIMARY KEY, pair TEXT, pnl REAL, trades INTEGER)''')
-
-    # PostgreSQL setup
-    conn_postgres = psycopg2.connect(
-        dbname=os.getenv('PG_DB'),
-        user=os.getenv('PG_USER'),
-        password=os.getenv('PG_PASS'),
-        host=os.getenv('PG_HOST'),
-        port=os.getenv('PG_PORT')
-    )
-    conn_postgres.execute('''CREATE TABLE IF NOT EXISTS trades (
-        id SERIAL PRIMARY KEY, timestamp TEXT, pair TEXT, action TEXT, amount REAL, price REAL)''')
-    conn_postgres.execute('''CREATE TABLE IF NOT EXISTS daily_pnl (
-        date TEXT, pair TEXT, pnl REAL, trades INTEGER, PRIMARY KEY (date, pair))''')
-
-    ohlc_data = {pair: pre_load_ohlc(pair, days=30) for pair in pairs}  # 30 days pre-load
-    external_data = get_external_data(pairs)
-    start_websocket(pairs, lambda p, pr: ohlc_data.update({p: pre_load_ohlc(p, days=1)}))
-
-    # Initial state load
-    in_position = {}
-    entry_prices = {}
-    cursor = conn_sqlite.execute("SELECT pair, price FROM trades ORDER BY id DESC LIMIT ?", (len(pairs),))
-    for row in cursor:
-        in_position[row[0]] = True
-        entry_prices[row[0]] = row[1]
-
-    daily_target = 0.015
-    current_date = time.strftime("%Y-%m-%d")
-    trades_today = {pair: 0 for pair in pairs}
-    daily_pnl = {pair: 0.0 for pair in pairs}
+    conn_postgres = psycopg2.connect(dbname=os.getenv('PG_DB'), user=os.getenv('PG_USER'), password=os.getenv('PG_PASS'), host=os.getenv('PG_HOST'), port=int(os.getenv('PG_PORT')))
+    init_database(conn_sqlite, conn_postgres)
+    historical_data = {}
+    phase = 1
 
     while True:
         try:
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S BST")
-            for pair in pairs:
-                if not pair.endswith('USD'):
-                    continue
-                price, volume, atr = get_market_data(pair)
-                usd_balance = sum(get_usd_balance(api_key, api_secret, pair) for pair in pairs) / len(pairs)
-                btc_balance = get_btc_balance(api_key, api_secret, pair)
-                dynamic_stop_loss = min(0.02, atr * 2 / price)
-                logging.info(f"{pair} - Time: {current_time} | Price: ${price:.2f} | USD: ${usd_balance:.2f} | BTC: {btc_balance:.6f} | ATR: {atr:.4f}")
-
-                signals = agent_system.get_signals(price, ohlc_data[pair], volume, atr, external_data[pair])
-                convictions = {k: v[0] for k, v in signals.items()}
-                directions = {k: v[1] for k, v in signals.items()}
-                logging.info(f"{pair} Agent Signals: %s", {k: f"{v[0]*100:.1f}% -> {v[1]}" for k, v in signals.items()})
-
-                if time.strftime("%Y-%m-%d") != current_date:
-                    for p in pairs:
-                        conn_sqlite.execute("INSERT OR REPLACE INTO daily_pnl (date, pair, pnl, trades) VALUES (?, ?, ?, ?)",
-                                           (current_date, p, daily_pnl[p], trades_today[p]))
-                        conn_postgres.execute("INSERT INTO daily_pnl (date, pair, pnl, trades) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                                             (current_date, p, daily_pnl[p], trades_today[p]))
-                    conn_sqlite.commit()
-                    conn_postgres.commit()
-                    current_date = time.strftime("%Y-%m-%d")
-                    for p in pairs:
-                        trades_today[p] = 0
-                        daily_pnl[p] = 0.0
-                    logging.info(f"New day started. Daily PNL: {[f'{p}: {v*100:.2f}%' for p, v in daily_pnl.items()]}")
-
-                if pair not in in_position:
-                    in_position[pair] = False
-                    entry_prices[pair] = 0.0
-                if not in_position[pair] and usd_balance > 1:
-                    conviction_met = all(conv >= 0.03 for conv in convictions.values())
-                    direction_aligned = all(d == directions['momentum'] for d in directions.values())
-                    if conviction_met and direction_aligned:
-                        txid = buy_btc(usd_balance / len(pairs), api_key, api_secret, pair)
-                        entry_prices[pair] = price
-                        in_position[pair] = True
-                        trades_today[pair] += 1
-                        conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)",
-                                           (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)",
-                                             (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_sqlite.commit()
-                        conn_postgres.commit()
-                        logging.info(f"{pair} Entered {directions['momentum']} at ~${price:.2f} TXID: {txid}")
-                    elif trades_today[pair] == 0 and time.strftime("%H%M") > "2300" and all(conv >= 0.025 for conv in convictions.values()) and direction_aligned:
-                        txid = buy_btc(usd_balance / len(pairs), api_key, api_secret, pair)
-                        entry_prices[pair] = price
-                        in_position[pair] = True
-                        trades_today[pair] += 1
-                        conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)",
-                                           (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)",
-                                             (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_sqlite.commit()
-                        conn_postgres.commit()
-                        logging.info(f"{pair} Fallback entered {directions['momentum']} at ~${price:.2f} TXID: {txid}")
-
-                elif in_position[pair] and btc_balance > 0:
-                    pnl_pct = (price - entry_prices[pair]) / entry_prices[pair]
-                    target_profit = max(0.015, atr * 2 / price)
-                    if pnl_pct >= target_profit:
-                        txid = sell_btc(api_key, api_secret, pair)
-                        daily_pnl[pair] += pnl_pct - 0.004
-                        conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)",
-                                           (current_time, pair, 'sell', btc_balance, price))
-                        conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)",
-                                             (current_time, pair, 'sell', btc_balance, price))
-                        conn_sqlite.commit()
-                        conn_postgres.commit()
-                        logging.info(f"{pair} Take Profit hit: {pnl_pct*100:.2f}%. Daily PNL: {daily_pnl[pair]*100:.2f}% TXID: {txid}")
-                        in_position[pair] = False
-                        ohlc_data[pair] = pre_load_ohlc(pair, days=30)
-                    elif pnl_pct <= -dynamic_stop_loss:
-                        txid = sell_btc(api_key, api_secret, pair)
-                        daily_pnl[pair] += pnl_pct
-                        conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)",
-                                           (current_time, pair, 'sell', btc_balance, price))
-                        conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)",
-                                             (current_time, pair, 'sell', btc_balance, price))
-                        conn_sqlite.commit()
-                        conn_postgres.commit()
-                        logging.info(f"{pair} Stop Loss hit: {pnl_pct*100:.2f}%. Daily PNL: {daily_pnl[pair]*100:.2f}% TXID: {txid}")
-                        in_position[pair] = False
-                        ohlc_data[pair] = pre_load_ohlc(pair, days=30)
-
-                if daily_pnl[pair] < daily_target and trades_today[pair] > 0 and time.strftime("%H%M") < "2300":
-                    logging.warning(f"{pair} Daily target {daily_target*100:.2f}% not met. Current PNL: {daily_pnl[pair]*100:.2f}%")
-                    if all(conv >= 0.025 for conv in convictions.values()) and direction_aligned:
-                        txid = buy_btc(usd_balance / len(pairs), api_key, api_secret, pair)
-                        entry_prices[pair] = price
-                        in_position[pair] = True
-                        trades_today[pair] += 1
-                        conn_sqlite.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (?, ?, ?, ?, ?)",
-                                           (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_postgres.execute("INSERT INTO trades (timestamp, pair, action, amount, price) VALUES (%s, %s, %s, %s, %s)",
-                                             (current_time, pair, 'buy', usd_balance / len(pairs), price))
-                        conn_sqlite.commit()
-                        conn_postgres.commit()
-                        logging.info(f"{pair} Risk-on entered {directions['momentum']} at ~${price:.2f} TXID: {txid}")
-
-            if time.strftime("%H%M") in ["1200", "2300"]:
-                strategy = gpt5_review()
-                logging.info(f"GPT-5 Strategy at {time.strftime('%H:%M')}: {strategy}")
-            last_trade = conn_sqlite.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 1").fetchone()
-            if last_trade and time.strftime("%M") == "00":
-                adjustment = gpt4o_review(dict(last_trade))
-                logging.info(f"GPT-4o Adjustment at {time.strftime('%H:%M')}: {adjustment}")
-                agent_system.adjust_convictions(adjustment)
-
+            if phase == 1 and check_api_connections():
+                send_alert(phase_implementation(phase))
+                phase = 2
+            elif phase == 2 and os.getenv('DRY_RUN', 'true').lower() == 'true':
+                pairs, amount_per_trade = adjust_strategy(pairs, historical_data)
+                for pair in pairs:
+                    data = get_market_data(pair)
+                    historical_data.setdefault(pair, []).append({'price': data['price']})
+                    if len(historical_data[pair]) > 100:
+                        historical_data[pair].pop(0)
+                    execute_trade(pair, data, amount_per_trade, gpt4o_review, gpt5_review, conn_sqlite, conn_postgres)
+                send_alert(phase_implementation(phase))
+                phase = 3
+            elif phase == 3 and os.getenv('DRY_RUN', 'false').lower() == 'false':
+                pairs, amount_per_trade = adjust_strategy(pairs, historical_data)
+                for pair in pairs:
+                    data = get_market_data(pair)
+                    historical_data.setdefault(pair, []).append({'price': data['price']})
+                    if len(historical_data[pair]) > 100:
+                        historical_data[pair].pop(0)
+                    execute_trade(pair, data, amount_per_trade, gpt4o_review, gpt5_review, conn_sqlite, conn_postgres)
+                if time.time() % 86400 < 60:
+                    global PAIRS
+                    PAIRS = optimize_performance(conn_sqlite) or PAIRS
+                send_alert(phase_implementation(phase))
             time.sleep(CHECK_INTERVAL)
         except Exception as e:
-            log_error(e)
-            send_alert(f"Trading Error: {e}")
+            log_error(f"Trading error: {e}")
+            send_alert(f"Paused due to: {e}. Restarting in 60s.")
             time.sleep(60)
-        finally:
-            conn_sqlite.close()
-            conn_postgres.close()
-
-def buy_btc(amount_usd, api_key, api_secret, pair):
-    from krakenex import API
-    kraken = API()
-    kraken.load_key((api_key, api_secret))
-    if DRY_RUN:
-        logging.info(f"[DRY RUN] Would buy ~${amount_usd} worth of {pair}")
-        return "simulated_txid"
-    response = kraken.query_private('AddOrder', {
-        'pair': pair,
-        'type': 'buy',
-        'ordertype': 'market',
-        'volume': str(amount_usd)
-    })
-    if response['error']:
-        raise Exception(f"Kraken Error: {response['error']}")
-    txid = response['result']['txid'][0]
-    logging.info(f"Bought {pair} with ${amount_usd}. TXID: {txid}")
-    return txid
-
-def sell_btc(api_key, api_secret, pair):
-    from krakenex import API
-    kraken = API()
-    kraken.load_key((api_key, api_secret))
-    if DRY_RUN:
-        logging.info(f"[DRY RUN] Would sell all {pair}")
-        return "simulated_txid"
-    response = kraken.query_private('AddOrder', {
-        'pair': pair,
-        'type': 'sell',
-        'ordertype': 'market',
-        'volume': 'all'
-    })
-    if response['error']:
-        raise Exception(f"Kraken Error: {response['error']}")
-    txid = response['result']['txid'][0]
-    logging.info(f"Sold all {pair}. TXID: {txid}")
-    return txid
-
-def get_usd_balance(api_key, api_secret, pair):
-    from krakenex import API
-    kraken = API()
-    kraken.load_key((api_key, api_secret))
-    balance = kraken.query_private('Balance')['result']
-    return float(balance.get('ZUSD', 0))
-
-def get_btc_balance(api_key, api_secret, pair):
-    from krakenex import API
-    kraken = API()
-    kraken.load_key((api_key, api_secret))
-    balance = kraken.query_private('Balance')['result']
-    asset = pair.split('USD')[0] + 'X' if pair.startswith('X') else pair.split('USD')[0]
-    return float(balance.get(asset, 0))
